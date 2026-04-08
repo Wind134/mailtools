@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -55,28 +56,31 @@ func (s *Sender) SendWithAttachments(to, subject, body string, attachments []str
 	}
 
 	var msg []byte
+	var err error
 	if len(attachments) == 0 {
 		msg = buildSimpleMessage(from, name, to, subject, body)
 	} else {
-		msg = buildMultipartMessage(from, name, to, subject, body, attachments)
+		msg, err = buildMultipartMessage(from, name, to, subject, body, attachments)
+		if err != nil {
+			return fmt.Errorf("build multipart message: %w", err)
+		}
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.SMTPHost, s.cfg.SMTPPort)
 	auth := smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.SMTPHost)
 
 	if s.cfg.SMTPPort == 465 {
-		return s.sendViaTLS(addr, auth, from, to, msg)
+		return s.sendViaImplicitTLS(addr, auth, from, to, msg)
 	}
-	return smtp.SendMail(addr, auth, from, []string{to}, msg)
+	return s.sendViaStartTLS(addr, auth, from, to, msg)
 }
 
-func (s *Sender) sendViaTLS(addr string, auth smtp.Auth, from, to string, msg []byte) error {
-	conn, err := net.Dial("tcp", addr)
+func (s *Sender) sendViaStartTLS(addr string, auth smtp.Auth, from, to string, msg []byte) error {
+	conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 
-	tlsCfg := &tls.Config{ServerName: s.cfg.SMTPHost}
 	client, err := smtp.NewClient(conn, s.cfg.SMTPHost)
 	if err != nil {
 		conn.Close()
@@ -84,14 +88,15 @@ func (s *Sender) sendViaTLS(addr string, auth smtp.Auth, from, to string, msg []
 	}
 	defer client.Close()
 
-	if err = client.Auth(auth); err != nil {
-		return fmt.Errorf("auth: %w", err)
-	}
-
 	if ok, _ := client.Extension("STARTTLS"); ok {
+		tlsCfg := &tls.Config{ServerName: s.cfg.SMTPHost}
 		if err = client.StartTLS(tlsCfg); err != nil {
 			return fmt.Errorf("starttls: %w", err)
 		}
+	}
+
+	if err = client.Auth(auth); err != nil {
+		return fmt.Errorf("auth: %w", err)
 	}
 
 	if err = client.Mail(from); err != nil {
@@ -115,22 +120,73 @@ func (s *Sender) sendViaTLS(addr string, auth smtp.Auth, from, to string, msg []
 	return client.Quit()
 }
 
+func (s *Sender) sendViaImplicitTLS(addr string, auth smtp.Auth, from, to string, msg []byte) error {
+	tlsCfg := &tls.Config{ServerName: s.cfg.SMTPHost}
+	conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+
+	tlsConn := tls.Client(conn, tlsCfg)
+
+	client, err := smtp.NewClient(tlsConn, s.cfg.SMTPHost)
+	if err != nil {
+		tlsConn.Close()
+		return fmt.Errorf("new client: %w", err)
+	}
+	defer client.Close()
+
+	if err = client.Auth(auth); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+
+	if err = client.Mail(from); err != nil {
+		return fmt.Errorf("mail from: %w", err)
+	}
+	if err = client.Rcpt(to); err != nil {
+		return fmt.Errorf("rcpt to: %w", err)
+	}
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("data: %w", err)
+	}
+	_, err = w.Write(msg)
+	if err != nil {
+		return fmt.Errorf("write data: %w", err)
+	}
+	err = w.Close()
+	if err != nil {
+		return fmt.Errorf("close data: %w", err)
+	}
+	return client.Quit()
+}
+
+func encodeSubject(subject string) string {
+	for _, r := range subject {
+		if r > 127 || r == '\n' || r == '\r' || r == '=' {
+			encoded := base64.StdEncoding.EncodeToString([]byte(subject))
+			return fmt.Sprintf("=?UTF-8?B?%s?=", encoded)
+		}
+	}
+	return subject
+}
+
 func buildSimpleMessage(from, fromName, to, subject, body string) []byte {
 	header := fmt.Sprintf("From: %s <%s>\r\n", fromName, from)
 	header += fmt.Sprintf("To: %s\r\n", to)
-	header += fmt.Sprintf("Subject: %s\r\n", subject)
+	header += fmt.Sprintf("Subject: %s\r\n", encodeSubject(subject))
 	header += "MIME-Version: 1.0\r\n"
 	header += "Content-Type: text/html; charset=UTF-8\r\n"
 	header += "\r\n"
 	return []byte(header + body)
 }
 
-func buildMultipartMessage(from, fromName, to, subject, body string, attachments []string) []byte {
+func buildMultipartMessage(from, fromName, to, subject, body string, attachments []string) ([]byte, error) {
 	boundary := "go-mail-boundary-" + randomString(16)
 
 	header := fmt.Sprintf("From: %s <%s>\r\n", fromName, from)
 	header += fmt.Sprintf("To: %s\r\n", to)
-	header += fmt.Sprintf("Subject: %s\r\n", subject)
+	header += fmt.Sprintf("Subject: %s\r\n", encodeSubject(subject))
 	header += "MIME-Version: 1.0\r\n"
 	header += fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\r\n", boundary)
 	header += "\r\n"
@@ -144,12 +200,12 @@ func buildMultipartMessage(from, fromName, to, subject, body string, attachments
 	for _, path := range attachments {
 		file, err := os.Open(path)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("open attachment %s: %w", path, err)
 		}
 		data, err := io.ReadAll(file)
 		file.Close()
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read attachment %s: %w", path, err)
 		}
 
 		filename := escapeMimeFilename(filepath.Base(path))
@@ -171,7 +227,7 @@ func buildMultipartMessage(from, fromName, to, subject, body string, attachments
 	}
 
 	parts.WriteString("--" + boundary + "--\r\n")
-	return []byte(header + parts.String())
+	return []byte(header + parts.String()), nil
 }
 
 func randomString(n int) string {
