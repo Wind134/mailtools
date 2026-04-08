@@ -1,0 +1,14 @@
+[Unit]
+Description=MailTools Web Service
+After=network.target mariadb.service
+
+[Service]
+Type=simple
+User=ping
+WorkingDirectory=/home/ping/mailtools
+ExecStart=/home/ping/go/bin/mailtools-web -config /home/ping/.config/mailtools/config.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

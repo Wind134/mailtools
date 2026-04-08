@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/smtp"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,10 +209,11 @@ func buildMultipartMessage(from, fromName, to, subject, body string, attachments
 			return nil, fmt.Errorf("read attachment %s: %w", path, err)
 		}
 
-		filename := escapeMimeFilename(filepath.Base(path))
+		filename := filepath.Base(path)
 		parts.WriteString("--" + boundary + "\r\n")
 		parts.WriteString("Content-Type: application/octet-stream\r\n")
-		parts.WriteString(fmt.Sprintf("Content-Disposition: attachment; filename=\"%s\"\r\n", filename))
+		parts.WriteString(fmt.Sprintf("Content-Disposition: attachment; filename=\"%s\"; filename*=UTF-8''%s\r\n",
+			escapeMimeFilename(filename), url.PathEscape(filename)))
 		parts.WriteString("Content-Transfer-Encoding: base64\r\n")
 		parts.WriteString("\r\n")
 
@@ -241,9 +243,29 @@ func randomString(n int) string {
 }
 
 func escapeMimeFilename(filename string) string {
+	needsEncoding := false
+	for _, r := range filename {
+		if r > 127 || r == '"' || r == '\n' || r == '\r' || r == '=' {
+			needsEncoding = true
+			break
+		}
+	}
+	if !needsEncoding {
+		filename = strings.ReplaceAll(filename, `"`, `""`)
+		return filename
+	}
+
+	encoded := base64.StdEncoding.EncodeToString([]byte(filename))
+	return fmt.Sprintf("=?UTF-8?B?%s?=", encoded)
+}
+
+func encodeFilenameRFC2231(filename string) string {
+	for _, r := range filename {
+		if r > 127 || r == '"' || r == '\n' || r == '\r' {
+			return fmt.Sprintf("UTF-8''%s", url.PathEscape(filename))
+		}
+	}
 	filename = strings.ReplaceAll(filename, `"`, `""`)
-	filename = strings.ReplaceAll(filename, "\n", " ")
-	filename = strings.ReplaceAll(filename, "\r", " ")
 	return filename
 }
 

@@ -1,0 +1,16 @@
+# MailTools 配置文件
+
+[database]
+host = "localhost"
+port = 3306
+user = "root"
+password = "your_password"
+name = "mailtools"
+
+[app]
+host = "0.0.0.0"
+port = 8080
+
+[jwt]
+secret = "change_this_to_random_string_in_production"
+expire_hours = 24
